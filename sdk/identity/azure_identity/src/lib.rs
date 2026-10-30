@@ -128,12 +128,77 @@ where
 const AZURE_AUTHORITY_HOST_ENV_KEY: &str = "AZURE_AUTHORITY_HOST";
 const AZURE_PUBLIC_CLOUD: &str = "https://login.microsoftonline.com";
 
+const AZURE_CLOUD_ENV_KEY: &str = "AZURE_CLOUD";
+const AZURE_US_GOVERNMENT_CLOUD: &str = "https://login.microsoftonline.us";
+const AZURE_CHINA_CLOUD: &str = "https://login.chinacloudapi.cn";
+
+/// Resolves the authority host named by `AZURE_CLOUD`, so that a cloud can be selected by
+/// configuration rather than in application source.
+///
+/// Returns `Ok(None)` when `AZURE_CLOUD` isn't set, in which case the caller falls back to the
+/// pre-existing `AZURE_AUTHORITY_HOST` behaviour.
+///
+/// Three vocabularies are accepted. `AzureCloud` and friends are the canonical cross-SDK
+/// spelling, matching `az cloud list`. `AZURE_PUBLIC_CLOUD` and friends are the values Java's
+/// `com.azure.core.models.AzureCloud` and Python's `azure.core.AzureClouds` already ship, which
+/// DIVERGE from the canonical spelling and are preserved only for compatibility. `AZURE`,
+/// `AZURE_CHINA` and `AZURE_US_GOVERNMENT` are Spring Cloud Azure's `CloudType` values, accepted
+/// because Spring already maps `AZURE_CLOUD` onto its `profile.cloud-type` property and rejecting
+/// them would break applications that set this variable today.
+fn authority_host_from_azure_cloud(env: &Env) -> Result<Option<String>> {
+    let name = match env.var(AZURE_CLOUD_ENV_KEY) {
+        Ok(value) => value.trim().to_string(),
+        Err(_) => return Ok(None),
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    match name.to_lowercase().as_str() {
+        "azurecloud" | "public" | "azure_public_cloud" | "azure" => {
+            Ok(Some(AZURE_PUBLIC_CLOUD.to_string()))
+        }
+        "azureusgovernment" | "usgovernment" | "azure_us_government" => {
+            Ok(Some(AZURE_US_GOVERNMENT_CLOUD.to_string()))
+        }
+        "azurechinacloud" | "china" | "azure_china_cloud" | "azure_china" => {
+            Ok(Some(AZURE_CHINA_CLOUD.to_string()))
+        }
+        // Spring Cloud Azure's CloudType::OTHER means "I configure endpoints myself", not "read
+        // the endpoint variables", so it is treated as though AZURE_CLOUD were unset.
+        "other" => Ok(None),
+        "azure_germany" => Err(Error::with_message(
+            ErrorKind::Other,
+            format!("{AZURE_CLOUD_ENV_KEY} names Microsoft Cloud Germany, which closed on October 29th, 2021"),
+        )),
+        "custom" => match env.var(AZURE_AUTHORITY_HOST_ENV_KEY) {
+            Ok(host) => Ok(Some(host)),
+            Err(_) => Err(Error::with_message(
+                ErrorKind::Other,
+                format!("{AZURE_CLOUD_ENV_KEY} is \"custom\" but {AZURE_AUTHORITY_HOST_ENV_KEY} is not set"),
+            )),
+        },
+        other => Err(Error::with_message(
+            ErrorKind::Other,
+            format!("{AZURE_CLOUD_ENV_KEY} has unrecognized value \"{other}\". Valid values are AzureCloud, AzureUSGovernment, AzureChinaCloud and custom"),
+        )),
+    }
+}
+
 fn get_authority_host(env: Option<Env>, cloud: Option<&CloudConfiguration>) -> Result<Url> {
     let authority_host = match cloud {
-        None => env
-            .unwrap_or_default()
-            .var(AZURE_AUTHORITY_HOST_ENV_KEY)
-            .unwrap_or_else(|_| AZURE_PUBLIC_CLOUD.to_string()),
+        None => {
+            let env = env.unwrap_or_default();
+            // AZURE_CLOUD describes the whole cloud and so takes precedence over the
+            // authority-only AZURE_AUTHORITY_HOST. When it is unset the pre-existing behaviour is
+            // preserved exactly.
+            match authority_host_from_azure_cloud(&env)? {
+                Some(host) => host,
+                None => env
+                    .var(AZURE_AUTHORITY_HOST_ENV_KEY)
+                    .unwrap_or_else(|_| AZURE_PUBLIC_CLOUD.to_string()),
+            }
+        }
         Some(CloudConfiguration::Custom(config)) => config.authority_host.clone(),
         Some(CloudConfiguration::AzureGovernment) => "https://login.microsoftonline.us".to_string(),
         Some(CloudConfiguration::AzureChina) => "https://login.chinacloudapi.cn".to_string(),
